@@ -288,41 +288,15 @@ export async function crearGrupo({
 }) {
   validarMiembrosGrupo(miembros)
 
-  // hemisemestres: [{ id, orden }] — los 2 del paralelo
-  const { data: grupo, error: errG } = await supabase
-    .from('grupos')
-    .insert({
-      paralelo_id: paraleloId,
-      numero,
-      max_integrantes: maxIntegrantes
-    })
-    .select('id')
-    .single()
-  if (errG) throw errG
-
-  // Insertar el tema correspondiente a cada hemisemestre
-  if (temas && hemisemestres.length > 0) {
-    const filasTemas = hemisemestres.map(h => ({
-      grupo_id: grupo.id,
-      hemisemestre_id: h.id,
-      tema: temas[h.id]
-    }))
-    const { error: errT } = await supabase
-      .from('grupo_temas')
-      .insert(filasTemas)
-    if (errT) throw errT
-  }
-
-  if (miembros && miembros.length > 0) {
-    const filas = miembros.map(m => ({
-      grupo_id: grupo.id,
-      usuario_id: m.usuarioId,
-      rol_grupo: m.rolGrupo,
-      lider: m.lider ?? false
-    }))
-    const { error: errM } = await supabase.from('grupo_miembros').insert(filas)
-    if (errM) throw errM
-  }
+  const { data: grupo, error } = await supabase.rpc('crear_grupo_admin', {
+    p_paralelo_id: paraleloId,
+    p_numero: numero,
+    p_max_integrantes: maxIntegrantes,
+    p_temas: temas ?? {},
+    p_hemisemestres: hemisemestres ?? [],
+    p_miembros: miembros ?? []
+  })
+  if (error) throw error
 
   return grupo
 }
@@ -1009,48 +983,30 @@ export async function obtenerResumenCoevaluacionEstudiantes(
     })
   })
 
-  const evaluadorIds = [...estudiantesPorId.keys()]
-  let coevaluaciones = []
-  if (evaluadorIds.length > 0) {
-    const { data, error } = await supabase
-      .from('coevaluaciones')
-      .select(
-        'evaluador_id, grupo_evaluado_id, estudiante_evaluado_id'
-      )
-      .eq('hemisemestre_id', hemisemestreId)
-      .in('evaluador_id', evaluadorIds)
-    if (error) throw error
-    coevaluaciones = data ?? []
-  }
-
-  const evaluadosPorPar = new Set(
-    coevaluaciones.map(c =>
-      `${c.evaluador_id}|${c.grupo_evaluado_id}|${c.estudiante_evaluado_id}`
-    )
-  )
   const gruposActivos = grupos.filter(grupo => grupo.coevaluacionHabilitada)
 
-  return [...estudiantesPorId.values()]
-    .map(estudiante => {
+  const estudiantes = [...estudiantesPorId.values()]
+  const resumen = await Promise.all(
+    estudiantes.map(async estudiante => {
       const grupoPropio = grupoPorEstudiante.get(estudiante.usuarioId)
       const gruposPendientes =
         gruposActivos.filter(grupo => grupo.id !== grupoPropio?.id)
-      const detalleGrupos = gruposPendientes.map(grupo => {
-        const integrantes = grupo.miembros.map(miembro => miembro.usuarioId)
-        const coevaluado =
-          integrantes.length > 0 &&
-          integrantes.every(usuarioId =>
-            evaluadosPorPar.has(
-              `${estudiante.usuarioId}|${grupo.id}|${usuarioId}`
-            )
+      const detalleGrupos = await Promise.all(
+        gruposPendientes.map(async grupo => {
+          const coevaluado = await yaCoevaluoGrupo(
+            estudiante.usuarioId,
+            grupo.id,
+            hemisemestreId,
+            grupo.miembros.map(miembro => miembro.usuarioId)
           )
-        return {
-          grupoId: grupo.id,
-          numero: grupo.numero,
-          tema: grupo.tema,
-          coevaluado
-        }
-      })
+          return {
+            grupoId: grupo.id,
+            numero: grupo.numero,
+            tema: grupo.tema,
+            coevaluado
+          }
+        })
+      )
       const pendientes = detalleGrupos.filter(grupo => !grupo.coevaluado)
       return {
         ...estudiante,
@@ -1062,7 +1018,9 @@ export async function obtenerResumenCoevaluacionEstudiantes(
         terminado: pendientes.length === 0
       }
     })
-    .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'))
+  )
+
+  return resumen.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'))
 }
 
 export async function yaCoevaluoGrupo(

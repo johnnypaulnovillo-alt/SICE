@@ -248,7 +248,7 @@ create table public.coevaluaciones (
 
 -- Trigger: impide auto-coevaluación (segunda línea de defensa tras la UI)
 create or replace function public.chk_no_autocoevaluacion()
-returns trigger as $
+returns trigger as $$
 begin
   if exists (
     select 1 from public.grupo_miembros gm
@@ -274,7 +274,7 @@ begin
   end if;
   return new;
 end;
-$ language plpgsql;
+$$ language plpgsql;
 
 create trigger trg_no_autocoevaluacion
 before insert or update on public.coevaluaciones
@@ -297,7 +297,11 @@ create table public.configuracion_notas (
 --   b) Registra la ponderación 70/30 en configuracion_notas.
 -- El profesor nunca tiene que hacer esto manualmente.
 create or replace function public.inicializar_paralelo()
-returns trigger as $$
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
 declare
   materia_nombre text;
   v_grupo_id uuid;
@@ -373,11 +377,111 @@ begin
 
   return new;
 end;
-$$ language plpgsql;
+$$;
 
 create trigger trg_inicializar_paralelo
 after insert on public.paralelos
 for each row execute function public.inicializar_paralelo();
+
+-- Creación de grupos de forma atomica: bloquea el paralelo y reserva el
+-- siguiente numero antes de insertar grupo, temas y miembros.
+create or replace function public.crear_grupo_admin(
+  p_paralelo_id uuid,
+  p_numero integer,
+  p_max_integrantes integer,
+  p_temas jsonb,
+  p_hemisemestres jsonb,
+  p_miembros jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_grupo_id uuid;
+  v_numero integer;
+  v_miembro jsonb;
+  v_lideres integer;
+  v_hemisemestre jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'Sesión requerida';
+  end if;
+  if not public.puede_gestionar_paralelo(p_paralelo_id) then
+    raise exception 'No autorizado';
+  end if;
+  if public.es_catalogo_fijo(p_paralelo_id) then
+    raise exception 'Los grupos de este catálogo son fijos';
+  end if;
+
+  perform id
+    from public.paralelos
+   where id = p_paralelo_id
+   for update;
+
+  select coalesce(max(numero), 0) + 1
+    into v_numero
+    from public.grupos
+   where paralelo_id = p_paralelo_id;
+
+  select count(*)
+    into v_lideres
+    from jsonb_array_elements(coalesce(p_miembros, '[]'::jsonb)) m
+   where coalesce((m->>'lider')::boolean, false);
+
+  if v_lideres <> 1 then
+    raise exception 'El grupo debe tener exactamente un líder';
+  end if;
+
+  insert into public.grupos (paralelo_id, numero, max_integrantes)
+  values (p_paralelo_id, v_numero, p_max_integrantes)
+  returning id into v_grupo_id;
+
+  for v_hemisemestre in
+    select value
+      from jsonb_array_elements(coalesce(p_hemisemestres, '[]'::jsonb))
+  loop
+    insert into public.grupo_temas (grupo_id, hemisemestre_id, tema)
+    select v_grupo_id,
+           h.id,
+           coalesce(p_temas->>(v_hemisemestre->>'id'), '')
+      from public.hemisemestres h
+     where h.id = (v_hemisemestre->>'id')::uuid
+       and h.paralelo_id = p_paralelo_id;
+  end loop;
+
+  for v_miembro in
+    select value
+      from jsonb_array_elements(coalesce(p_miembros, '[]'::jsonb))
+  loop
+    insert into public.grupo_miembros (
+      grupo_id,
+      usuario_id,
+      rol_grupo,
+      lider
+    )
+    values (
+      v_grupo_id,
+      (v_miembro->>'usuarioId')::uuid,
+      v_miembro->>'rolGrupo',
+      coalesce((v_miembro->>'lider')::boolean, false)
+    );
+  end loop;
+
+  return jsonb_build_object(
+    'id', v_grupo_id,
+    'numero', v_numero
+  );
+end;
+$$;
+
+revoke all on function public.crear_grupo_admin(
+  uuid, integer, integer, jsonb, jsonb, jsonb
+) from public;
+grant execute on function public.crear_grupo_admin(
+  uuid, integer, integer, jsonb, jsonb, jsonb
+) to authenticated;
 
 -- Operaciones de asignación ejecutadas de forma atómica. El estudiante solo
 -- puede modificar su propia pertenencia mientras la etapa esté abierta.
@@ -794,7 +898,7 @@ returns void
 language plpgsql
 security definer
 set search_path = public
-as $
+as $$
 declare
   item jsonb;
   v_grupo_id uuid;
@@ -819,7 +923,7 @@ begin
        and hemisemestre_id = p_hemisemestre_id;
   end loop;
 end;
-$;
+$$;
 
 revoke all on function public.actualizar_coevaluacion_grupos(jsonb, uuid) from public;
 grant execute on function public.actualizar_coevaluacion_grupos(jsonb, uuid) to authenticated;
